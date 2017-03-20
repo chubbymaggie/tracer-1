@@ -1,11 +1,11 @@
 import os
 import time
 import angr
-import signal
 import socket
 import claripy
 import simuvex
 import tempfile
+import signal
 import subprocess
 import shellphish_qemu
 from .tracerpov import TracerPoV
@@ -13,13 +13,16 @@ from .cachemanager import LocalCacheManager
 from .simprocedures import receive
 from .simprocedures import FixedOutTransmit, FixedInReceive, FixedRandom
 from simuvex import s_options as so
+from simuvex import s_cc
 
 import logging
 
 l = logging.getLogger("tracer.Tracer")
-
 # global writable attribute used for specifying cache procedures
 GlobalCacheManager = None
+
+EXEC_STACK = 'EXEC_STACK'
+QEMU_CRASH = 'SEG_FAULT'
 
 class TracerInstallError(Exception):
     pass
@@ -36,6 +39,8 @@ class TracerMisfollowError(Exception):
 class TracerDynamicTraceOOBError(Exception):
     pass
 
+class TracerTimeout(Exception):
+    pass
 
 class Tracer(object):
     '''
@@ -45,7 +50,10 @@ class Tracer(object):
     def __init__(self, binary, input=None, pov_file=None, simprocedures=None,
                  hooks=None, seed=None, preconstrain_input=True,
                  preconstrain_flag=True, resiliency=True, chroot=None,
-                 add_options=None, remove_options=None, trim_history=True):
+                 add_options=None, remove_options=None, trim_history=True,
+                 project=None, dump_syscall=False, dump_cache=True,
+                 max_size = None, exclude_sim_procedures_list=None,
+                 argv = None):
         """
         :param binary: path to the binary to be traced
         :param input: concrete input string to feed to binary
@@ -65,6 +73,14 @@ class Tracer(object):
         :param remove_options: remove options from the state which is used to
             do tracing
         :param trim_history: Trim the history of a path.
+        :param project: The original project.
+        :param dump_syscall: True if we want to dump the syscall information
+        :param max_size: Optionally set max size of input. Defaults to size
+            of preconstrained input.
+        :param exclude_sim_procedures_list: What SimProcedures to hook or not
+            at load time. Defaults to ["malloc","free","calloc","realloc"]
+        :param argv: Optionally specify argv params (i,e,: ['./calc', 'parm1'])
+            defaults to binary name with no params.
         """
 
         self.binary = binary
@@ -74,6 +90,9 @@ class Tracer(object):
         self.preconstrain_flag = preconstrain_flag
         self.simprocedures = {} if simprocedures is None else simprocedures
         self._hooks = {} if hooks is None else hooks
+        self.input_max_size = max_size or len(input)
+        self.exclude_sim_procedures_list = exclude_sim_procedures_list or ["malloc","free","calloc","realloc"]
+        self.argv = argv or [binary]
 
         for h in self._hooks:
             l.debug("Hooking %#x -> %s", h, self._hooks[h].__name__)
@@ -86,8 +105,12 @@ class Tracer(object):
         self.add_options = set() if add_options is None else add_options
         self.trim_history = trim_history
         self.constrained_addrs = []
+        # the final state after execution with input/pov_file
+        self.final_state = None
+        # the path after execution with input/pov_file
+        self.path = None
 
-        cm = LocalCacheManager() if GlobalCacheManager is None else GlobalCacheManager
+        cm = LocalCacheManager(dump_cache=dump_cache) if GlobalCacheManager is None else GlobalCacheManager
         # cache managers need the tracer to be set for them
         self._cache_manager = cm
         self._cache_manager.set_tracer(self)
@@ -128,8 +151,10 @@ class Tracer(object):
             self.pov = False
 
         # internal project object, useful for obtaining certain kinds of info
-        self._p = angr.Project(self.binary)
-
+        if project is None:
+            self._p = angr.Project(self.binary)
+        else:
+            self._p = project
         self.base = None
         self.tracer_qemu = None
         self.tracer_qemu_path = None
@@ -143,6 +168,10 @@ class Tracer(object):
         # if the input causes a crash, what address does it crash at?
         self.crash_addr = None
 
+        self.crash_state = None
+
+        self.crash_type = None
+
         # CGC flag data
         self.cgc_flag_bytes = [claripy.BVS("cgc-flag-byte-%d" % i, 8) for i in xrange(0x1000)]
 
@@ -151,10 +180,14 @@ class Tracer(object):
         # as their dynamic counterpart
         self._magic_content = None
 
-        # will set crash_mode correctly
+        # will set crash_mode correctly and also discover the QEMU base addr
         self.trace = self.dynamic_trace()
 
         l.info("trace consists of %d basic blocks", len(self.trace))
+
+        # Check if we need to rebase to QEMU's addr
+        if self.qemu_base_addr != self._p.loader.main_bin.get_min_addr():
+            l.warn("Our base address doesn't match QEMU's. Changing ours to 0x%x",self.qemu_base_addr)
 
         self.preconstraints = []
 
@@ -172,17 +205,18 @@ class Tracer(object):
         # whether we should follow the qemu trace
         self.no_follow = False
 
-        # set of resolved dynamic functions which have been resolved
-        # useful for handling PLT stubs
-        self._resolved = set()
-
         # this will be set by _prepare_paths
         self.unicorn_enabled = False
+
+        # initilize the syscall statistics if the flag is on
+        self._dump_syscall = dump_syscall
+        if self._dump_syscall:
+            self._syscall = []
 
         self.path_group = self._prepare_paths()
 
         # this is used to track constrained addresses
-        self._address_concretization = list()
+        self._address_concretization = []
 
 # EXPOSED
 
@@ -192,10 +226,10 @@ class Tracer(object):
 
         :return: a path_group describing the possible paths at the next branch
                  branches which weren't taken by the dynamic trace are placed
-                 into the 'missed' stash and any preconstraints are removed
-                 from 'missed' branches.
+                 into the 'missed' stash. Paths in the 'missed' stash still
+                 have preconstraints which should be removed using the
+                 remove_preconstraints method.
         """
-
         while len(self.path_group.active) == 1:
             current = self.path_group.active[0]
 
@@ -218,22 +252,20 @@ class Tracer(object):
 
                 # angr steps through the same basic block twice when a syscall
                 # occurs
-                elif current.addr == self.previous_addr or self._p.is_hooked(self.previous_addr) and \
-                        self._p.hooked_by(self.previous_addr).IS_SYSCALL:
+                elif current.addr == self.previous_addr or \
+                        self._p._simos.syscall_table.get_by_addr(self.previous_addr) is not None:
                     pass
                 elif current.jumpkind.startswith("Ijk_Sys"):
                     self.bb_cnt += 1
 
                 # handle library calls and simprocedures
-                elif self._p.is_hooked(current.addr) \
+                elif self._p.is_hooked(current.addr) or \
+                        self._p._simos.syscall_table.get_by_addr(current.addr) is not None \
                         or not self._address_in_binary(current.addr):
-                    # are we going to be jumping through the PLT stub?
-                    # if so we need to take special care
-                    r_plt = self._p.loader.main_bin.reverse_plt
-                    if current.addr not in self._resolved \
-                            and self.previous.addr in r_plt:
-                        self.bb_cnt += 2
-                        self._resolved.add(current.addr)
+
+                    # If dynamic trace is in the PLT stub, update bb_cnt until it's out
+                    while self._addr_in_plt(self.trace[self.bb_cnt]):
+                        self.bb_cnt += 1
 
                 # handle hooked functions
                 # we use current._project since it seems to be different than self._p
@@ -288,21 +320,28 @@ class Tracer(object):
             # detect back loops
             # this might still break for huge basic blocks with back loops
             # but it seems unlikely
-            bl = self._p.factory.block(self.trace[self.bb_cnt-1],
-                    backup_state=current.state)
-            back_targets = set(bl.vex.constant_jump_targets) & set(bl.instruction_addrs)
-            if self.bb_cnt < len(self.trace) and self.trace[self.bb_cnt] in back_targets:
-                target_to_jumpkind = bl.vex.constant_jump_targets_and_jumpkinds
-                if target_to_jumpkind[self.trace[self.bb_cnt]] == "Ijk_Boring":
-                    bbl_max_bytes = 800
+            try:
+                bl = self._p.factory.block(self.trace[self.bb_cnt-1],
+                        backup_state=current.state)
+                back_targets = set(bl.vex.constant_jump_targets) & set(bl.instruction_addrs)
+                if self.bb_cnt < len(self.trace) and self.trace[self.bb_cnt] in back_targets:
+                    target_to_jumpkind = bl.vex.constant_jump_targets_and_jumpkinds
+                    if target_to_jumpkind[self.trace[self.bb_cnt]] == "Ijk_Boring":
+                        bbl_max_bytes = 800
+            except (simuvex.s_errors.SimMemoryError, simuvex.s_errors.SimEngineError):
+                bbl_max_bytes = 800
 
             # if we're not in crash mode we don't care about the history
             if self.trim_history and not self.crash_mode:
                 current.trim_history()
 
             self.prev_path_group = self.path_group
-            self.path_group = self.path_group.step(max_size=bbl_max_bytes)
-
+            self.path_group = self.path_group.step(size=bbl_max_bytes)
+        
+            if self.crash_type == EXEC_STACK:
+                self.path_group = self.path_group.stash(from_stash='active',
+                        to_stash='crashed')
+                return self.path_group
             # if our input was preconstrained we have to keep on the lookout
             # for unsat paths
             if self.preconstrain_input:
@@ -316,6 +355,7 @@ class Tracer(object):
                 tpg = self.path_group.step()
                 # if we're in crash mode let's populate the crashed stash
                 if self.crash_mode:
+                    self.crash_type = QEMU_CRASH
                     tpg = tpg.stash(from_stash='active', to_stash='crashed')
                     return tpg
                 # if we're in normal follow mode, just step the path to
@@ -357,8 +397,6 @@ class Tracer(object):
         # make sure we only have one or zero active paths at this point
         assert len(self.path_group.active) < 2
 
-        l.debug("taking the branch at %x", self.path_group.active[0].addr)
-
         rpg = self.path_group
 
         # something weird... maybe we hit a rep instruction?
@@ -366,13 +404,14 @@ class Tracer(object):
         if not self.path_group.active[0].state.se.satisfiable():
             l.warning("detected small discrepency between qemu and angr, "
                     "attempting to fix known cases")
-
             # did our missed branch try to go back to a rep?
             target = self.path_group.missed[0].addr
             if self._p.arch.name == 'X86' or self._p.arch.name == 'AMD64':
 
-                # does it looks like a rep?
-                if self._p.factory.block(target).bytes.startswith("\xf3"):
+                # does it looks like a rep? rep ret doesn't count!
+                if self._p.factory.block(target).bytes.startswith("\xf3") and \
+                   not self._p.factory.block(target).bytes.startswith("\xf3\xc3"):
+
                     l.info("rep discrepency detected, repairing...")
                     # swap the stashes
                     s = self.path_group.move('missed', 'chosen')
@@ -449,8 +488,11 @@ class Tracer(object):
 
             # if we spot a crashed path in crash mode return the goods
             if self.crash_mode and 'crashed' in branches.stashes:
-                last_block = self.trace[self.bb_cnt - 1]
-                l.info("crash occured in basic block %x", last_block)
+                if self.crash_type == EXEC_STACK:
+                    return self.path_group.crashed[0], self.crash_state
+                elif self.crash_type == QEMU_CRASH:
+                    last_block = self.trace[self.bb_cnt - 1]
+                    l.info("crash occured in basic block %x", last_block)
 
                 # time to recover the crashing state
 
@@ -515,6 +557,8 @@ class Tracer(object):
                 state = successors[0]
 
                 l.debug("tracing done!")
+                self.final_state = state
+                self.path = self.previous
                 return (self.previous, state)
 
         # this is a concrete trace, there should only be ONE path
@@ -524,6 +568,8 @@ class Tracer(object):
                     expected only one path")
 
         # the caller is responsible for removing preconstraints
+        self.final_state = None
+        self.path = all_paths[0]
         return all_paths[0], None
 
     def remove_preconstraints(self, path, to_composite_solver=True, simplify=True):
@@ -537,7 +583,12 @@ class Tracer(object):
         for con in self.preconstraints:
             precon_cache_keys.add(con.cache_key)
 
-        new_constraints = filter(lambda x: x.cache_key not in precon_cache_keys, path.state.se.constraints)
+        # if we used the replacement solver we didn't add constraints we need to remove so keep all constraints
+        if so.REPLACEMENT_SOLVER in path.state.options:
+            new_constraints = path.state.se.constraints
+        else:
+            new_constraints = filter(lambda x: x.cache_key not in precon_cache_keys, path.state.se.constraints)
+
 
         if path.state.has_plugin("zen_plugin"):
             new_constraints = path.state.get_plugin("zen_plugin").filter_constraints(new_constraints)
@@ -553,7 +604,6 @@ class Tracer(object):
             l.debug("simplifying solver")
             path.state.se.simplify()
             l.debug("simplification done")
-
 
         path.state.se._solver.result = None
 
@@ -702,11 +752,9 @@ class Tracer(object):
                         stdin=in_s,
                         stdout=stdout_f,
                         stderr=devnull)
-
                 for write in self.pov_file.writes:
                     out_s.send(write)
                     time.sleep(.01)
-
             ret = p.wait()
             # did a crash occur?
             if ret < 0:
@@ -725,6 +773,9 @@ class Tracer(object):
         addrs = [int(v.split('[')[1].split(']')[0], 16)
                  for v in trace.split('\n')
                  if v.startswith('Trace')]
+
+        # Find where qemu loaded the binary. Primarily for PIE
+        self.qemu_base_addr = int(trace.split("start_code")[1].split("\n")[0],16)
 
         # grab the faulting address
         if self.crash_mode:
@@ -792,6 +843,10 @@ class Tracer(object):
         if repair_entry_state_opts:
             entry_state.options |= {so.TRACK_ACTION_HISTORY}
 
+        # add the preconstraints to the actual constraints on the state if we aren't replacing
+        if so.REPLACEMENT_SOLVER not in entry_state.options:
+            entry_state.add_constraints(*self.preconstraints)
+
     def _preconstrain_flag_page(self, entry_state, flag_bytes):
         '''
         preconstrain the data in the flag page
@@ -815,8 +870,7 @@ class Tracer(object):
 
     def _set_linux_simprocedures(self, project):
         for symbol in self.simprocedures:
-            project.set_sim_procedure(
-                    project.loader.main_bin,
+            project.hook_symbol(
                     symbol,
                     self.simprocedures[symbol])
 
@@ -892,7 +946,7 @@ class Tracer(object):
         if not self.pov:
             fs = {'/dev/stdin': simuvex.storage.file.SimFile(
                 "/dev/stdin", "r",
-                size=len(self.input))}
+                size=self.input_max_size)}
 
         else:
             fs = self._prepare_dialogue()
@@ -909,6 +963,7 @@ class Tracer(object):
             try:
                 options.add(so.UNICORN)
                 options.add(so.UNICORN_SYM_REGS_SUPPORT)
+                options.add(so.UNICORN_HANDLE_TRANSMIT_SYSCALL)
                 self.unicorn_enabled = True
                 l.debug("unicorn tracing enabled")
             except AttributeError:
@@ -944,7 +999,7 @@ class Tracer(object):
             entry_state = state
 
         if not self.pov:
-            entry_state.cgc.input_size = len(self.input)
+            entry_state.cgc.input_size = self.input_max_size
 
         if len(self._hooks):
             self._set_simproc_limits(entry_state)
@@ -953,6 +1008,10 @@ class Tracer(object):
         self._preconstrain_flag_page(entry_state, self.cgc_flag_bytes)
         entry_state.memory.store(0x4347c000, claripy.Concat(*self.cgc_flag_bytes))
 
+        if self._dump_syscall:
+            entry_state.inspect.b('syscall', when=simuvex.BP_BEFORE, action=self.syscall)
+        entry_state.inspect.b('path_step', when=simuvex.BP_AFTER,
+                action=self.check_stack)
         pg = project.factory.path_group(
             entry_state,
             immutable=True,
@@ -965,12 +1024,33 @@ class Tracer(object):
 
         return pg
 
+    def syscall(self, state):
+        syscall_addr = state.se.any_int(state.ip)
+        # 0xa000008 is terminate, which we exclude from syscall statistics.
+        if syscall_addr != 0xa000008:
+            args = s_cc.SyscallCC['X86']['CGC'](self._p.arch).get_args(state, 4)
+            d = {'addr': syscall_addr}
+            for i in xrange(4):
+                d['arg_%d' % i] = args[i]
+                d['arg_%d_symbolic' % i] = args[i].ast.symbolic
+            self._syscall.append(d)
+
+    def check_stack(self, state):
+        if state.memory.load(state.ip, state.ip.length).symbolic:
+            l.debug("executing input-related code")
+            self.crash_type = EXEC_STACK
+            self.crash_state = state
+
     def _linux_prepare_paths(self):
         '''
         prepare the initial paths for Linux binaries
         '''
 
-        project = angr.Project(self.binary)
+        # Only requesting custom base if this is a PIE
+        if self._p.loader.main_bin.pic:
+            project = angr.Project(self.binary,load_options={'main_opts': {'custom_base_addr': self.qemu_base_addr }},exclude_sim_procedures_list=self.exclude_sim_procedures_list)
+        else:
+            project = angr.Project(self.binary,exclude_sim_procedures_list=self.exclude_sim_procedures_list)
 
         if not self.crash_mode:
             self._set_linux_simprocedures(project)
@@ -980,22 +1060,26 @@ class Tracer(object):
         # fix stdin to the size of the input being traced
         fs = {'/dev/stdin': simuvex.storage.file.SimFile(
             "/dev/stdin", "r",
-            size=len(self.input))}
+            size=self.input_max_size)}
 
         options = set()
         options.add(so.CGC_ZERO_FILL_UNCONSTRAINED_MEMORY)
         options.add(so.BYPASS_UNSUPPORTED_SYSCALL)
+        options.add(so.REPLACEMENT_SOLVER)
+        options.add(so.UNICORN)
+        options.add(so.UNICORN_HANDLE_TRANSMIT_SYSCALL)
         if self.crash_mode:
             options.add(so.TRACK_ACTION_HISTORY)
 
         self.remove_options |= so.simplification
         self.add_options |= options
-        entry_state = project.factory.entry_state(
+        entry_state = project.factory.full_init_state(
                 fs=fs,
                 concrete_fs=True,
                 chroot=self.chroot,
                 add_options=self.add_options,
-                remove_options=self.remove_options)
+                remove_options=self.remove_options,
+                args=self.argv)
 
         if self.preconstrain_input:
             self._preconstrain_state(entry_state)
@@ -1011,6 +1095,19 @@ class Tracer(object):
                 hierarchy=False,
                 save_unconstrained=self.crash_mode)
 
+        # Step forward until we catch up with QEMU
+        if pg.active[0].addr != self.trace[0]:
+            pg = pg.explore(find=project.entry)
+            pg = pg.drop(stash="unsat")
+            pg = pg.unstash(from_stash="found",to_stash="active")
+
         # don't step here, because unlike CGC we aren't going to be starting
         # anywhere but the entry point
         return pg
+
+    def _addr_in_plt(self,addr):
+        """
+        Check if an address is inside the ptt section
+        """
+        plt = self._p.loader.main_bin.sections_map['.plt']
+        return addr >= plt.min_addr and addr <= plt.max_addr
